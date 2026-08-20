@@ -1,0 +1,56 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    # Plugin YouTube obligatoire depuis fin 2024 : la source YouTube intégrée
+    # de Lavalink ne fonctionne plus de façon fiable sans lui.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.13.5"
+      repository: "https://maven.lavalink.dev/releases"
+  server:
+    password: "youshallnotpass"   # doit correspondre à LAVALINK_PASSWORD dans .env
+    sources:
+      # On désactive la source YouTube native : c'est le plugin qui la remplace.
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW          # LOW = plus léger pour un Raspberry Pi
+    trackStuckThresholdMs: 10000
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+
+plugins:
+  youtube:
+    enabled: true
+    # Clients utilisés pour récupérer les flux. MUSIC/WEB/ANDROID_VR sont
+    # actuellement les plus stables. Voir le README pour le poToken si besoin.
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - WEB
+      - WEBEMBEDDED
+
+metrics:
+  prometheus:
+    enabled: false
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
+  logback:
+    rollingpolicy:
+      max-file-size: 25MB
+      max-history: 7

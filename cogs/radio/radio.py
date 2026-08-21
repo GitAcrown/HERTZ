@@ -140,21 +140,51 @@ class Radio(commands.Cog):
         await self.db.close()
 
     async def _connect_lavalink(self) -> None:
-        host = self.bot.config.get("LAVALINK_HOST", "127.0.0.1")  # type: ignore[attr-defined]
-        port = self.bot.config.get("LAVALINK_PORT", "2333")  # type: ignore[attr-defined]
-        password = self.bot.config.get("LAVALINK_PASSWORD", "youshallnotpass")  # type: ignore[attr-defined]
+        host = (self.bot.config.get("LAVALINK_HOST") or "127.0.0.1").strip()  # type: ignore[attr-defined]
+        port = (self.bot.config.get("LAVALINK_PORT") or "2333").strip()  # type: ignore[attr-defined]
+        password = (self.bot.config.get("LAVALINK_PASSWORD") or "youshallnotpass").strip()  # type: ignore[attr-defined]
         uri = f"http://{host}:{port}"
+        ok = await self._probe_lavalink(uri, password)
+        if not ok:
+            logger.error(
+                "Lavalink n'écoute pas sur %s. "
+                "Dans un autre terminal : cd lavalink && java -Xmx200m -jar Lavalink.jar "
+                "— attendre « ready to accept connections » avant de lancer le bot.",
+                uri,
+            )
         node = wavelink.Node(uri=uri, password=password)
         try:
             await wavelink.Pool.connect(nodes=[node], client=self.bot, cache_capacity=100)
             logger.info("Connexion au noeud Lavalink demandée (%s).", uri)
         except Exception as exc:
             logger.error(
-                "Impossible de joindre Lavalink (%s) : %s. "
-                "Le bot démarre mais la lecture est indisponible.",
+                "Impossible de joindre Lavalink (%s) : %s: %r",
                 uri,
+                type(exc).__name__,
                 exc,
             )
+
+    async def _probe_lavalink(self, uri: str, password: str) -> bool:
+        try:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=4)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{uri}/version",
+                    headers={"Authorization": password},
+                ) as resp:
+                    body = (await resp.text()).strip()
+                    logger.info("Lavalink HTTP %s /version → %s", resp.status, body[:120] or "(vide)")
+                    return resp.status < 500
+        except Exception as exc:
+            logger.error(
+                "Sonde Lavalink échouée (%s) : %s: %s",
+                uri,
+                type(exc).__name__,
+                exc or repr(exc),
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Helpers d'état

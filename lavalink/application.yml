@@ -28,6 +28,10 @@ lavalink:
     playerUpdateInterval: 5
     youtubeSearchEnabled: true
     soundcloudSearchEnabled: true
+    timeouts:
+      connectTimeoutMs: 10000
+      connectionRequestTimeoutMs: 10000
+      socketTimeoutMs: 10000
 
 plugins:
   youtube:
@@ -37,11 +41,17 @@ plugins:
     clients:
       - MUSIC
       - TV
+      - TVHTML5_SIMPLY
       - ANDROID_MUSIC
       - ANDROID_VR
       - WEB
       - MWEB
       - WEBEMBEDDED
+    # Cipher YouTube : 1.18.2 n'extrait plus le player JS (sig function).
+    # Instance publique, 10 req/s. Pour un serveur dédié : https://github.com/kikkia/yt-cipher
+    remoteCipher:
+      url: "https://cipher.kikkia.dev/"
+      userAgent: "Hertz"
     # YouTube bloque les clients anonymes (« This video requires login »).
     # OAuth : compte brûleur recommandé. Au 1er lancement, suivre le code
     # dans les logs Lavalink (dev.lavalink.youtube.http.YoutubeOauth2Handler).

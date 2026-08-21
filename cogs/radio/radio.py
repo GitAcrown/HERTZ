@@ -27,7 +27,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from .db import Database
-from .library import LibraryManager
+from .library import (
+    HALL_OF_FAME_MIN_VOTES,
+    HALL_OF_FAME_RATIO,
+    LibraryManager,
+)
 from .models import Track, TrackStatus, Vote
 from .radio_service import RadioService
 from .spotify import SpotifyResolver
@@ -36,6 +40,7 @@ from .views import (
     AddedView,
     ConfigView,
     HelpView,
+    HofConfigView,
     NoticeView,
     NowPlayingState,
     NowPlayingView,
@@ -54,6 +59,9 @@ SETTING_VOICE_CHANNEL = "voice_channel_id"
 SETTING_TEXT_CHANNEL = "text_channel_id"
 SETTING_NP_MESSAGE = "np_message_id"
 SETTING_VOLUME = "volume"
+SETTING_HOF_RATIO = "hof_ratio"
+SETTING_HOF_MIN_VOTES = "hof_min_votes"
+SETTING_HOF_LIKES = "hof_likes"  # ancien réglage, repli pour min_votes
 
 DISCONNECT_GRACE_SECONDS = 30
 CAPACITY_CHECK_MINUTES = 30
@@ -173,6 +181,35 @@ class Radio(commands.Cog):
         self._pending.pop(token, None)
         self._pending_meta.pop(token, None)
 
+    @staticmethod
+    def _parse_setting_int(raw: Optional[str], default: int) -> int:
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    async def _hof_rules(self, guild: discord.Guild) -> tuple[int, int]:
+        raw_ratio = await self.db.get_guild_setting(guild.id, SETTING_HOF_RATIO)
+        raw_votes = await self.db.get_guild_setting(guild.id, SETTING_HOF_MIN_VOTES)
+        if raw_votes is None:
+            raw_votes = await self.db.get_guild_setting(guild.id, SETTING_HOF_LIKES)
+        ratio = min(100, max(1, self._parse_setting_int(raw_ratio, HALL_OF_FAME_RATIO)))
+        votes = max(1, self._parse_setting_int(raw_votes, HALL_OF_FAME_MIN_VOTES))
+        return ratio, votes
+
+    async def _home_channel(self, guild: discord.Guild) -> Optional[discord.VoiceChannel]:
+        channel = await self._get_config_channel(guild, SETTING_VOICE_CHANNEL)
+        return channel if isinstance(channel, discord.VoiceChannel) else None
+
+    @staticmethod
+    def _humans(channel: Optional[discord.abc.Snowflake]) -> list[discord.Member]:
+        members = getattr(channel, "members", None)
+        if not members:
+            return []
+        return [m for m in members if not m.bot]
+
     async def _get_config_channel(self, guild: discord.Guild, key: str):
         await self.db.inherit_legacy_settings(guild.id)
         raw = await self.db.get_guild_setting(guild.id, key)
@@ -210,7 +247,7 @@ class Radio(commands.Cog):
     async def _deny_voice(self, interaction: discord.Interaction) -> None:
         view = NoticeView(
             "Vocal requis",
-            "Rejoins le salon radio pour voter, skip ou pause.",
+            "Rejoins le salon où joue la radio pour voter, skip ou pause.",
         )
         await self._respond(interaction, view=view, ephemeral=True)
 
@@ -470,6 +507,27 @@ class Radio(commands.Cog):
         await self._restore_volume(player)
         return player
 
+    async def _move_to_voice(
+        self, guild: discord.Guild, channel: discord.VoiceChannel
+    ) -> Optional[wavelink.Player]:
+        player = self._get_player(guild)
+        if player is None:
+            return await self._connect_player(channel)
+        current = player.channel
+        if current is not None and current.id == channel.id:
+            return player
+        try:
+            await player.move_to(channel)
+        except Exception as exc:
+            logger.warning("move_to impossible (%s), reconnexion : %s", channel, exc)
+            try:
+                await player.disconnect()
+            except Exception:
+                pass
+            return await self._connect_player(channel)
+        await self._restore_volume(player)
+        return player
+
     async def _restore_volume(self, player: wavelink.Player) -> None:
         guild = player.guild
         if guild is None:
@@ -696,12 +754,22 @@ class Radio(commands.Cog):
         for guild in self.bot.guilds:
             if not self._guild_allowed(guild):
                 continue
-            channel = await self._get_config_channel(guild, SETTING_VOICE_CHANNEL)
-            if not isinstance(channel, discord.VoiceChannel):
-                continue
-            humans = [m for m in channel.members if not m.bot]
-            if humans:
-                await self._handle_first_join(guild, channel)
+            player = self._get_player(guild)
+            here = player.channel if player else None
+            home = await self._home_channel(guild)
+            if here is not None and (home is None or here.id != home.id):
+                if self._humans(here):
+                    await self._ensure_playing(player)
+                    continue
+                if home is not None:
+                    moved = await self._move_to_voice(guild, home)
+                    if moved and self._humans(home):
+                        await self._ensure_playing(moved)
+                    elif moved:
+                        self._schedule_leave(guild, home)
+                    continue
+            if home is not None and self._humans(home):
+                await self._handle_first_join(guild, home)
 
     @commands.Cog.listener()
     async def on_wavelink_track_start(
@@ -754,7 +822,7 @@ class Radio(commands.Cog):
         await self._play_next(player)
 
     # ------------------------------------------------------------------
-    # Auto-join / auto-leave
+    # Auto-join / auto-leave / drag
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
@@ -764,31 +832,55 @@ class Radio(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        if member.bot:
-            return
         guild = member.guild
         if not self._guild_allowed(guild):
             return
-        voice_channel = await self._get_config_channel(guild, SETTING_VOICE_CHANNEL)
-        if not isinstance(voice_channel, discord.VoiceChannel):
+        if self.bot.user is not None and member.id == self.bot.user.id:
+            await self._on_own_voice_update(guild, after)
+            return
+        if member.bot:
             return
 
-        joined = after.channel == voice_channel and before.channel != voice_channel
-        left = before.channel == voice_channel and after.channel != voice_channel
+        player = self._get_player(guild)
+        here = player.channel if player else None
+        home = await self._home_channel(guild)
 
-        if joined:
-            await self._handle_first_join(guild, voice_channel)
-        elif left:
-            await self._handle_maybe_empty(guild, voice_channel)
+        if after.channel is not None and before.channel != after.channel:
+            if here is not None and after.channel.id == here.id:
+                self._cancel_leave(guild.id)
+                await self._ensure_playing(player)
+            elif here is None and home is not None and after.channel.id == home.id:
+                await self._handle_first_join(guild, home)
+
+        if before.channel is not None and before.channel != after.channel:
+            if here is not None and before.channel.id == here.id:
+                if not self._humans(before.channel):
+                    self._schedule_leave(guild, before.channel)
+
+    async def _on_own_voice_update(
+        self, guild: discord.Guild, after: discord.VoiceState
+    ) -> None:
+        if after.channel is None:
+            self._cancel_leave(guild.id)
+            self._current.pop(guild.id, None)
+            return
+        if not isinstance(after.channel, discord.VoiceChannel):
+            return
+        self._cancel_leave(guild.id)
+        player = self._get_player(guild)
+        if self._humans(after.channel):
+            if player:
+                await self._ensure_playing(player)
+            return
+        self._schedule_leave(guild, after.channel)
 
     async def _handle_first_join(
         self, guild: discord.Guild, channel: discord.VoiceChannel
     ) -> None:
-        task = self._disconnect_tasks.pop(guild.id, None)
-        if task:
-            task.cancel()
-
+        self._cancel_leave(guild.id)
         player = self._get_player(guild)
+        if player is not None and player.channel is not None and player.channel.id != channel.id:
+            return
         if player is None:
             player = await self._connect_player(channel)
             if player is None:
@@ -796,35 +888,48 @@ class Radio(commands.Cog):
             logger.info("Rejoint le salon vocal radio de %s.", guild.name)
         await self._ensure_playing(player)
 
-    async def _handle_maybe_empty(
-        self, guild: discord.Guild, channel: discord.VoiceChannel
-    ) -> None:
-        humans = [m for m in channel.members if not m.bot]
-        if humans:
-            return
-        if guild.id in self._disconnect_tasks:
-            return
+    def _cancel_leave(self, guild_id: int) -> None:
+        task = self._disconnect_tasks.pop(guild_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_leave(self, guild: discord.Guild, channel: discord.VoiceChannel) -> None:
+        self._cancel_leave(guild.id)
         self._disconnect_tasks[guild.id] = asyncio.create_task(
-            self._delayed_disconnect(guild, channel)
+            self._delayed_leave(guild, channel)
         )
 
-    async def _delayed_disconnect(
+    async def _delayed_leave(
         self, guild: discord.Guild, channel: discord.VoiceChannel
     ) -> None:
+        nxt: Optional[discord.VoiceChannel] = None
         try:
             await asyncio.sleep(DISCONNECT_GRACE_SECONDS)
-            humans = [m for m in channel.members if not m.bot]
-            if humans:
+            if self._humans(channel):
                 return
             player = self._get_player(guild)
-            if player:
+            if player is None or player.channel is None or player.channel.id != channel.id:
+                return
+            home = await self._home_channel(guild)
+            if home is not None and channel.id != home.id:
+                logger.info("Salon temporaire vide : retour radio (%s).", guild.name)
+                moved = await self._move_to_voice(guild, home)
+                if moved and not self._humans(home):
+                    nxt = home
+                elif moved:
+                    await self._ensure_playing(moved)
+            else:
                 await player.disconnect()
                 logger.info("Salon vocal vide : déconnexion de %s.", guild.name)
-            self._current.pop(guild.id, None)
+                self._current.pop(guild.id, None)
         except asyncio.CancelledError:
-            pass
+            return
         finally:
-            self._disconnect_tasks.pop(guild.id, None)
+            current = self._disconnect_tasks.get(guild.id)
+            if current is asyncio.current_task():
+                self._disconnect_tasks.pop(guild.id, None)
+        if nxt is not None:
+            self._schedule_leave(guild, nxt)
 
     # ------------------------------------------------------------------
     # Tâche de fond
@@ -1018,7 +1123,14 @@ class Radio(commands.Cog):
                 ephemeral=True,
             )
             return
-        result = await self.library.vote(interaction.user.id, item.track_id, value)
+        hof_ratio, hof_min_votes = await self._hof_rules(guild)
+        result = await self.library.vote(
+            interaction.user.id,
+            item.track_id,
+            value,
+            hof_ratio=hof_ratio,
+            hof_min_votes=hof_min_votes,
+        )
         if result is None:
             await self._respond(
                 interaction,
@@ -1035,7 +1147,17 @@ class Radio(commands.Cog):
                 NoticeView(
                     "Hall of Fame",
                     result.track.display,
-                    note="15 likes — ce morceau ne s'archive plus.",
+                    note=f"{hof_ratio} % de likes · {hof_min_votes} votes min — ne s'archive plus.",
+                ),
+                guild=guild,
+            )
+        elif result.demoted_from_hof:
+            note = f"{verb} · sorti du Hall of Fame"
+            await self._broadcast_notice(
+                NoticeView(
+                    "Hall of Fame",
+                    result.track.display,
+                    note="Le ratio likes / dislikes n'est plus suffisant.",
                 ),
                 guild=guild,
             )
@@ -1257,6 +1379,49 @@ class Radio(commands.Cog):
     async def pause_cmd(self, interaction: discord.Interaction) -> None:
         await self._toggle_pause(interaction, from_button=False)
 
+    @app_commands.command(
+        name="drag",
+        description="Ramène la radio dans ton salon vocal (retour auto au salon radio).",
+    )
+    async def drag(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return
+        target = member.voice.channel if member.voice else None
+        if not isinstance(target, discord.VoiceChannel):
+            await self._respond(
+                interaction,
+                view=NoticeView("Drag", "Rejoins un salon vocal d'abord."),
+                ephemeral=True,
+            )
+            return
+        home = await self._home_channel(guild)
+        self._cancel_leave(guild.id)
+        player = await self._move_to_voice(guild, target)
+        if player is None:
+            await self._respond(
+                interaction,
+                view=NoticeView("Drag", "Impossible de rejoindre ce salon."),
+                ephemeral=True,
+            )
+            return
+        await self._ensure_playing(player)
+        if home is not None and target.id == home.id:
+            body = f"De retour sur {target.mention}."
+            note = "Salon radio définitif."
+        elif home is not None:
+            body = f"Je joue sur {target.mention}."
+            note = f"Retour auto sur {home.mention} dès qu'il n'y a plus personne ici."
+        else:
+            body = f"Je joue sur {target.mention}."
+            note = "Pas de salon radio configuré — `/radioconfig` pour en fixer un."
+        await self._respond(
+            interaction,
+            view=NoticeView("Drag", body, note=note),
+            ephemeral=True,
+        )
+
     @app_commands.command(name="volume", description="Règle le volume de la radio (0–100).")
     @app_commands.describe(niveau="Volume entre 0 et 100")
     async def volume_cmd(
@@ -1328,7 +1493,17 @@ class Radio(commands.Cog):
 
     @app_commands.command(name="aide", description="Comment marche la radio Hz.")
     async def aide(self, interaction: discord.Interaction) -> None:
-        await self._respond(interaction, view=HelpView(), ephemeral=True)
+        guild = interaction.guild
+        hof_ratio, hof_min_votes = (
+            await self._hof_rules(guild)
+            if guild is not None
+            else (HALL_OF_FAME_RATIO, HALL_OF_FAME_MIN_VOTES)
+        )
+        await self._respond(
+            interaction,
+            view=HelpView(hof_ratio=hof_ratio, hof_min_votes=hof_min_votes),
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="radioconfig", description="(Admin) Configure les salons vocal/texte de la radio."
@@ -1365,9 +1540,58 @@ class Radio(commands.Cog):
         await interaction.response.send_message(
             view=ConfigView(salon_vocal, text_target, note=note)
         )
-        humans = [m for m in salon_vocal.members if not m.bot]
-        if humans:
+        humans = self._humans(salon_vocal)
+        player = self._get_player(guild)
+        away = (
+            player is not None
+            and player.channel is not None
+            and player.channel.id != salon_vocal.id
+        )
+        if humans and not away:
             await self._handle_first_join(guild, salon_vocal)
+
+    @app_commands.command(
+        name="hofconfig",
+        description="(Admin) Ratio likes / dislikes du Hall of Fame.",
+    )
+    @app_commands.describe(
+        ratio="Pourcentage de likes requis (ex. 75 = 75 % de likes)",
+        votes="Nombre minimum de votes (likes + dislikes) avant d'évaluer le ratio",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def hofconfig(
+        self,
+        interaction: discord.Interaction,
+        ratio: Optional[app_commands.Range[int, 1, 100]] = None,
+        votes: Optional[app_commands.Range[int, 1, 500]] = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            return
+        current_ratio, current_votes = await self._hof_rules(guild)
+        if ratio is None and votes is None:
+            await interaction.response.send_message(
+                view=HofConfigView(current_ratio, current_votes),
+                ephemeral=True,
+            )
+            return
+
+        new_ratio = int(ratio) if ratio is not None else current_ratio
+        new_votes = int(votes) if votes is not None else current_votes
+        await self.db.set_guild_setting(guild.id, SETTING_HOF_RATIO, str(new_ratio))
+        await self.db.set_guild_setting(guild.id, SETTING_HOF_MIN_VOTES, str(new_votes))
+        promoted, demoted = await self.library.apply_hof_rules(
+            hof_ratio=new_ratio, hof_min_votes=new_votes
+        )
+        note_bits = []
+        if promoted:
+            note_bits.append(f"{promoted} promu(s)")
+        if demoted:
+            note_bits.append(f"{demoted} sorti(s)")
+        note = " · ".join(note_bits)
+        await interaction.response.send_message(
+            view=HofConfigView(new_ratio, new_votes, note=note)
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

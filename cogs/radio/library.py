@@ -22,7 +22,8 @@ logger = logging.getLogger("Hz.Radio.Library")
 
 # --- Paramètres réglables du système de survie ---
 TARGET_ACTIVE_SIZE = 100          # taille cible de la bibliothèque active
-HALL_OF_FAME_LIKES = 15           # seuil de likes pour le Hall of Fame
+HALL_OF_FAME_RATIO = 75           # % de likes parmi les votes (surchargeable)
+HALL_OF_FAME_MIN_VOTES = 15       # votes min. avant d'évaluer le ratio
 LIKE_WEIGHT = 3                   # poids d'un like dans survival_score
 DISLIKE_WEIGHT = 2                # poids d'un dislike (pénalité)
 AGE_PENALTY_PER_DAY = 0.5         # pénalité d'ancienneté par jour
@@ -39,6 +40,7 @@ class VoteResult:
     dislikes: int
     changed: bool
     promoted_to_hof: bool
+    demoted_from_hof: bool = False
 
 
 class LibraryManager:
@@ -88,7 +90,25 @@ class LibraryManager:
     # Votes
     # ------------------------------------------------------------------
 
-    async def vote(self, user_id: int, track_id: int, value: int) -> Optional[VoteResult]:
+    @staticmethod
+    def hof_qualifies(
+        track: Track, *, hof_ratio: int, hof_min_votes: int
+    ) -> bool:
+        """True si assez de votes et likes / (likes+dislikes) >= ratio."""
+        total = track.likes + track.dislikes
+        if total < max(1, hof_min_votes):
+            return False
+        return track.likes * 100 >= max(1, hof_ratio) * total
+
+    async def vote(
+        self,
+        user_id: int,
+        track_id: int,
+        value: int,
+        *,
+        hof_ratio: int = HALL_OF_FAME_RATIO,
+        hof_min_votes: int = HALL_OF_FAME_MIN_VOTES,
+    ) -> Optional[VoteResult]:
         """Pose un like (+1) ou dislike (-1). Toggle si le même vote est rejoué."""
         track = await self.db.get_track(track_id)
         if track is None:
@@ -106,28 +126,101 @@ class LibraryManager:
         track = await self.db.get_track(track_id)
         assert track is not None
 
-        promoted = await self._maybe_promote_hall_of_fame(track)
+        promoted, demoted = await self._maybe_update_hall_of_fame(
+            track, hof_ratio=hof_ratio, hof_min_votes=hof_min_votes
+        )
         return VoteResult(
             track=track,
             likes=track.likes,
             dislikes=track.dislikes,
             changed=changed,
             promoted_to_hof=promoted,
+            demoted_from_hof=demoted,
         )
 
-    async def like(self, user_id: int, track_id: int) -> Optional[VoteResult]:
-        return await self.vote(user_id, track_id, Vote.LIKE)
+    async def like(
+        self,
+        user_id: int,
+        track_id: int,
+        *,
+        hof_ratio: int = HALL_OF_FAME_RATIO,
+        hof_min_votes: int = HALL_OF_FAME_MIN_VOTES,
+    ) -> Optional[VoteResult]:
+        return await self.vote(
+            user_id,
+            track_id,
+            Vote.LIKE,
+            hof_ratio=hof_ratio,
+            hof_min_votes=hof_min_votes,
+        )
 
-    async def dislike(self, user_id: int, track_id: int) -> Optional[VoteResult]:
-        return await self.vote(user_id, track_id, Vote.DISLIKE)
+    async def dislike(
+        self,
+        user_id: int,
+        track_id: int,
+        *,
+        hof_ratio: int = HALL_OF_FAME_RATIO,
+        hof_min_votes: int = HALL_OF_FAME_MIN_VOTES,
+    ) -> Optional[VoteResult]:
+        return await self.vote(
+            user_id,
+            track_id,
+            Vote.DISLIKE,
+            hof_ratio=hof_ratio,
+            hof_min_votes=hof_min_votes,
+        )
 
-    async def _maybe_promote_hall_of_fame(self, track: Track) -> bool:
-        if track.status != TrackStatus.HALL_OF_FAME and track.likes >= HALL_OF_FAME_LIKES:
+    async def _maybe_update_hall_of_fame(
+        self, track: Track, *, hof_ratio: int, hof_min_votes: int
+    ) -> tuple[bool, bool]:
+        qualifies = self.hof_qualifies(
+            track, hof_ratio=hof_ratio, hof_min_votes=hof_min_votes
+        )
+        if qualifies and track.status != TrackStatus.HALL_OF_FAME:
             await self.db.set_track_status(track.id, TrackStatus.HALL_OF_FAME)
             track.status = TrackStatus.HALL_OF_FAME
-            logger.info("Hall of Fame : '%s' (%d likes)", track.display, track.likes)
-            return True
-        return False
+            logger.info(
+                "Hall of Fame : '%s' (+%d / -%d)",
+                track.display,
+                track.likes,
+                track.dislikes,
+            )
+            return True, False
+        if not qualifies and track.status == TrackStatus.HALL_OF_FAME:
+            await self.db.set_track_status(track.id, TrackStatus.ACTIVE)
+            track.status = TrackStatus.ACTIVE
+            logger.info(
+                "Sortie Hall of Fame : '%s' (+%d / -%d)",
+                track.display,
+                track.likes,
+                track.dislikes,
+            )
+            return False, True
+        return False, False
+
+    async def apply_hof_rules(
+        self, *, hof_ratio: int, hof_min_votes: int
+    ) -> tuple[int, int]:
+        """Réévalue actifs + HoF après un changement de règles.
+
+        Retourne ``(promus, rétrogradés)``.
+        """
+        tracks = await self.db.get_tracks_by_status(
+            TrackStatus.ACTIVE, TrackStatus.HALL_OF_FAME
+        )
+        promoted = 0
+        demoted = 0
+        for track in tracks:
+            qualifies = self.hof_qualifies(
+                track, hof_ratio=hof_ratio, hof_min_votes=hof_min_votes
+            )
+            if qualifies and track.status != TrackStatus.HALL_OF_FAME:
+                await self.db.set_track_status(track.id, TrackStatus.HALL_OF_FAME)
+                promoted += 1
+            elif not qualifies and track.status == TrackStatus.HALL_OF_FAME:
+                await self.db.set_track_status(track.id, TrackStatus.ACTIVE)
+                demoted += 1
+        return promoted, demoted
 
     # ------------------------------------------------------------------
     # Lecture

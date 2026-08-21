@@ -137,13 +137,18 @@ class NoticeView(discord.ui.LayoutView):
 
 
 class HelpView(discord.ui.LayoutView):
-    def __init__(self) -> None:
+    def __init__(self, *, hof_ratio: int = 75, hof_min_votes: int = 15) -> None:
         super().__init__(timeout=60)
+        hof = (
+            f"**Hall of Fame** · {hof_ratio} % de likes, au moins {hof_min_votes} votes "
+            "· le morceau ne s’archive plus."
+        )
         body = (
             "**Ajouter** · `/add` un lien YouTube / Spotify ou une recherche.\n"
             "**File** · ce que vous ajoutez passe **avant** la radio.\n"
             "**Voter** · Like / Dislike / Skip depuis le panneau, en vocal.\n"
-            "**Hall of Fame** · 15 likes : le morceau ne s’archive plus.\n"
+            f"{hof}\n"
+            "**Déplacer** · `/drag` ramène la radio dans ton salon ; elle rentre toute seule.\n"
             "**Bibliothèque** · ~100 actifs ; le reste s’archive tout seul."
         )
         children: list[discord.ui.Item] = [
@@ -153,7 +158,7 @@ class HelpView(discord.ui.LayoutView):
             discord.ui.TextDisplay(body),
             discord.ui.Separator(),
             discord.ui.TextDisplay(
-                "-# Commandes · `/add` `/queue` `/nowplaying` `/stats` `/pause` `/volume`"
+                "-# Commandes · `/add` `/queue` `/nowplaying` `/stats` `/pause` `/volume` `/drag`"
             ),
         ]
         self.add_item(discord.ui.Container(*children))
@@ -172,6 +177,22 @@ class ConfigView(discord.ui.LayoutView):
             discord.ui.TextDisplay("-# Un salon, une file, une bibliothèque"),
             discord.ui.Separator(),
             discord.ui.TextDisplay("\n".join(lines)),
+        ]
+        _append_controls(children, note=note)
+        self.add_item(discord.ui.Container(*children))
+
+
+class HofConfigView(discord.ui.LayoutView):
+    def __init__(self, ratio: int, min_votes: int, *, note: str = "") -> None:
+        super().__init__(timeout=60)
+        children: list[discord.ui.Item] = [
+            discord.ui.TextDisplay("## Hall of Fame"),
+            discord.ui.TextDisplay("-# Ratio likes / dislikes, réglable par serveur"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(
+                f"**Ratio** · {ratio} % de likes parmi les votes\n"
+                f"**Votes min.** · {min_votes} (likes + dislikes)"
+            ),
         ]
         _append_controls(children, note=note)
         self.add_item(discord.ui.Container(*children))

@@ -80,5 +80,29 @@ class SurvivalTests(unittest.TestCase):
         )
 
 
+class HofThresholdTests(unittest.TestCase):
+    def test_needs_min_votes(self) -> None:
+        track = _track(likes=14, dislikes=0)
+        self.assertFalse(
+            LibraryManager.hof_qualifies(track, hof_ratio=75, hof_min_votes=15)
+        )
+        self.assertTrue(
+            LibraryManager.hof_qualifies(_track(likes=15, dislikes=0), hof_ratio=75, hof_min_votes=15)
+        )
+
+    def test_ratio_not_raw_likes(self) -> None:
+        # 12 likes / 4 dislikes = 75 %, 16 votes
+        ok = _track(likes=12, dislikes=4)
+        self.assertTrue(LibraryManager.hof_qualifies(ok, hof_ratio=75, hof_min_votes=15))
+        # 11 likes / 5 dislikes = 68,75 %
+        low = _track(likes=11, dislikes=5)
+        self.assertFalse(LibraryManager.hof_qualifies(low, hof_ratio=75, hof_min_votes=15))
+
+    def test_high_ratio_blocked_by_dislikes(self) -> None:
+        track = _track(likes=20, dislikes=20)
+        self.assertFalse(LibraryManager.hof_qualifies(track, hof_ratio=75, hof_min_votes=15))
+        self.assertTrue(LibraryManager.hof_qualifies(track, hof_ratio=50, hof_min_votes=15))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -119,6 +119,7 @@ class Radio(commands.Cog):
         self._failed: dict[int, set[int]] = {}
         self._pending: dict[str, list[PendingAdd]] = {}
         self._pending_meta: dict[str, tuple[int, int]] = {}  # token -> (user_id, guild_id)
+        self._lavalink_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Cycle de vie
@@ -130,14 +131,25 @@ class Radio(commands.Cog):
             await self.db.inherit_legacy_settings(self._radio_guild_id)
         logger.info("Base de données Radio prête (%s).", DB_PATH)
         self.bot.add_view(persistent_now_playing_stub())
-        await self._connect_lavalink()
         self.capacity_loop.start()
+        # Wavelink exige bot.user (header User-Id). cog_load tourne avant login.
+        self._lavalink_task = asyncio.create_task(self._connect_lavalink_when_ready())
 
     async def cog_unload(self) -> None:
         self.capacity_loop.cancel()
+        if self._lavalink_task is not None:
+            self._lavalink_task.cancel()
         for task in self._disconnect_tasks.values():
             task.cancel()
         await self.db.close()
+
+    async def _connect_lavalink_when_ready(self) -> None:
+        await self.bot.wait_until_ready()
+        if self.bot.user is None:
+            logger.error("Bot user introuvable, connexion Lavalink abandonnée.")
+            return
+        logger.info("Bot identifié (%s), connexion Wavelink…", self.bot.user.id)
+        await self._connect_lavalink()
 
     async def _connect_lavalink(self) -> None:
         host = (self.bot.config.get("LAVALINK_HOST") or "127.0.0.1").strip()  # type: ignore[attr-defined]

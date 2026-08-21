@@ -32,13 +32,28 @@ lavalink:
 plugins:
   youtube:
     enabled: true
-    # Clients utilisés pour récupérer les flux. MUSIC/WEB/ANDROID_VR sont
-    # actuellement les plus stables. Voir le README pour le poToken si besoin.
+    allowSearch: true
+    # MUSIC ne stream pas : il sert à ytmsearch. Le playback passe par TV/WEB/etc.
     clients:
       - MUSIC
+      - TV
+      - ANDROID_MUSIC
       - ANDROID_VR
       - WEB
+      - MWEB
       - WEBEMBEDDED
+    # YouTube bloque les clients anonymes (« This video requires login »).
+    # OAuth : compte brûleur recommandé. Au 1er lancement, suivre le code
+    # dans les logs Lavalink (dev.lavalink.youtube.http.YoutubeOauth2Handler).
+    # Ensuite coller le refreshToken ici et relancer.
+    oauth:
+      enabled: true
+      # refreshToken: "colle-le-ici-après-le-flow"
+      # skipInitialization: true
+    # Alternative à OAuth (WEB / WEBEMBEDDED uniquement) :
+    # pot:
+    #   token: ""
+    #   visitorData: ""
 
 metrics:
   prometheus:
@@ -50,6 +65,7 @@ logging:
   level:
     root: INFO
     lavalink: INFO
+    "dev.lavalink.youtube.http.YoutubeOauth2Handler": INFO
   logback:
     rollingpolicy:
       max-file-size: 25MB

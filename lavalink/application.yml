@@ -6,7 +6,7 @@ lavalink:
   plugins:
     # Plugin YouTube obligatoire depuis fin 2024 : la source YouTube intégrée
     # de Lavalink ne fonctionne plus de façon fiable sans lui.
-    - dependency: "dev.lavalink.youtube:youtube-plugin:1.13.5"
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
       repository: "https://maven.lavalink.dev/releases"
   server:
     password: "youshallnotpass"   # doit correspondre à LAVALINK_PASSWORD dans .env

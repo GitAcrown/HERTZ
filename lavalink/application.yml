@@ -37,16 +37,14 @@ plugins:
   youtube:
     enabled: true
     allowSearch: true
-    # MUSIC ne stream pas : il sert à ytmsearch. Le playback passe par TV/WEB/etc.
+    # Aligné sur youtube-source + ce que Red documente (issue #4505 / #6645) :
+    # MUSIC = recherche, TV = playback avec OAuth, WEB* = playback + cipher distant.
     clients:
       - MUSIC
       - TV
-      - TVHTML5_SIMPLY
-      - ANDROID_MUSIC
-      - ANDROID_VR
+      - WEBEMBEDDED
       - WEB
       - MWEB
-      - WEBEMBEDDED
     # Cipher YouTube : 1.18.2 n'extrait plus le player JS (sig function).
     # Instance publique, 10 req/s. Pour un serveur dédié : https://github.com/kikkia/yt-cipher
     remoteCipher:
